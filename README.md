@@ -1,8 +1,6 @@
 # Improved GNN-PE for QM9 graph bandits
 
-This repository is a cleaned, QM9-focused extension of the public [GNNBO](https://github.com/lasgroup/GNNBO) codebase for the paper *Graph Neural Network Bandits*. It keeps only the code needed for the experiments in the project progress report and removes the old synthetic-study launchers, duplicate snapshots, archived ZIPs, downloaded datasets, and stored result files.
-
-The project studies how to make GNN Phased Elimination (GNN-PE) more practical for graph bandit optimization over molecular candidates:
+This repository is a cleaned, QM9-focused extension of the public [GNNBO](https://github.com/lasgroup/GNNBO) codebase for the paper *Graph Neural Network Bandits*. The project studies how to make GNN Phased Elimination (GNN-PE) more practical for graph bandit optimization over molecular candidates:
 
 - fine-tuned GNN-PE versus retraining from scratch,
 - GNN-UCB scratch and fine-tune baselines,
@@ -39,11 +37,11 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-If your platform needs a specific PyTorch / PyTorch Geometric wheel combination, install the compatible PyTorch stack first, then install the remaining requirements.
+If the platform needs a specific PyTorch / PyTorch Geometric wheel combination, one must install the compatible PyTorch stack first, then install the remaining requirements.
 
-## Reproduce the report experiments
+## Reproduce the experiments
 
-The report uses QM9 domains with `|G|=1000`, `T=300`, and seeds `0..9`. All runner defaults are aligned with those values; the commands below spell out the result folders so the plotting scripts can consume them directly.
+The experiment uses QM9 domains with `|G|=1000`, `T=300`, and seeds `0..9`. All runner defaults are aligned with those values; the commands below spell out the result folders so the plotting scripts can consume them directly.
 
 ### 1. GNN-PE scratch and fine-tune
 
@@ -87,7 +85,7 @@ The GNN-PE runner exposes:
 - `--domain_scan_method full|fft|graph_kmeans`
 - `--domain_scan_apply_to both|c1|c2`
 
-where `c1` means Eq. (1) only and `c2` means Eq. (2) only.
+where `c1` means Eq. (C.1) only and `c2` means Eq. (C.2) only.
 
 ```bash
 # Approximate Eq. (1) and Eq. (2)
@@ -145,8 +143,6 @@ for seed in {0..9}; do
     --exp_result_folder results/qm9_phasedgp_T300_N1000_kmeans_C2only
 done
 ```
-
-The progress report includes runtime rows for the `both` and Eq. (2)-only variants. The Eq. (1)-only code paths are also implemented here and are documented above so they can be regenerated even though those runtimes were not included in the report table.
 
 ## Regenerate figures and runtime tables
 
