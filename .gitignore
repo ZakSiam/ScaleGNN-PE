@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Downloaded datasets and generated experiment artifacts
+data/
+results/
+figures/
+
+# Local editor/runtime artifacts
+.idea/
+.vscode/
+.ipynb_checkpoints/
