@@ -306,6 +306,41 @@ def cluster_medoids_from_kernel(K: np.ndarray, labels: np.ndarray, k: int) -> Li
     return medoids
 
 
+def pivoted_cholesky(K: np.ndarray, m: int, tol: float = 1e-12) -> List[int]:
+    """
+    Greedy pivoted (partial) Cholesky selection on a PSD kernel K.
+
+    At each step we hold a residual diagonal d, where d[i] is the leftover variance of
+    point i NOT yet explained by the already-picked pivots (equivalently, the posterior
+    variance of i given the current pivot set). We greedily pick the point with the
+    largest residual (the least-explained / most-informative one), append it as a
+    representative, then downdate every point's residual by the new Cholesky column.
+
+    This greedily minimizes trace(K - K_hat), i.e. the kernel reconstruction error, in
+    O(N*m) time touching only m columns of K (never the full N^2 factorization).
+
+    Returns the list of pivot indices (the representatives), in selection order.
+    """
+    n = K.shape[0]
+    m = int(min(max(m, 1), n))
+    d = np.array(np.diag(K), dtype=np.float64, copy=True)  # residual variances
+    L = np.zeros((n, m), dtype=np.float64)                 # partial Cholesky columns
+    pivots: List[int] = []
+    for t in range(m):
+        p = int(np.argmax(d))
+        if d[p] <= tol:
+            break  # numerically rank-deficient: remaining points are already explained
+        pivots.append(p)
+        col = K[:, p].astype(np.float64)
+        if t > 0:
+            col = col - L[:, :t] @ L[p, :t]   # subtract off what earlier pivots explain
+        ell = col / np.sqrt(d[p])
+        L[:, t] = ell
+        d = np.clip(d - ell * ell, 0.0, None)  # every point's residual shrinks
+        d[p] = 0.0                             # picked point is fully explained
+    return pivots
+
+
 @dataclass
 class ScanIndexer:
     """
@@ -326,6 +361,7 @@ def build_scan_indexer(
     fft_m: int,
     kmeans_k: int,
     kmeans_iter: int,
+    pivchol_m: int = 300,
     random_state: Optional[np.random.RandomState] = None,
 ) -> ScanIndexer:
     """
@@ -352,4 +388,13 @@ def build_scan_indexer(
         meta = {"wl_h": int(wl_h), "kmeans_k": int(kmeans_k), "kmeans_iter": int(kmeans_iter)}
         return ScanIndexer(method="graph_kmeans", reps=medoids, rep_of=rep_of, meta=meta)
 
-    raise ValueError(f"Unknown scan method: {method}. Use 'fft' or 'graph_kmeans'.")
+    if method == "pivchol":
+        # Greedy pivoted Cholesky selection on the WL kernel. Reps minimize kernel
+        # reconstruction error (trace of residual); hard nearest-rep assignment uses the
+        # SAME assign_to_reps machinery as fft, so this isolates the SELECTION rule.
+        reps = pivoted_cholesky(K, m=int(pivchol_m))
+        rep_of = assign_to_reps(K, reps)
+        meta = {"wl_h": int(wl_h), "pivchol_m": len(reps)}
+        return ScanIndexer(method="pivchol", reps=reps, rep_of=rep_of, meta=meta)
+
+    raise ValueError(f"Unknown scan method: {method}. Use 'fft', 'graph_kmeans', or 'pivchol'.")

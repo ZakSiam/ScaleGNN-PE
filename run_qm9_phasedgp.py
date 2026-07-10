@@ -348,7 +348,7 @@ if __name__ == "__main__":
 
     # Scan acceleration ablations (apply to finetune only)
     parser.add_argument("--domain_scan_method", type=str, default="full",
-                        help="Scan reduction for (C.1)/(C.2) in finetune mode: full|fft|graph_kmeans")
+                        help="Scan reduction for (C.1)/(C.2) in finetune mode: full|fft|graph_kmeans|pivchol")
     parser.add_argument("--domain_scan_apply_to", type=str, default="both",
                         help="Where to apply scan reduction in finetune mode: both|c1|c2 (C.1=max-var selection, C.2=maximizer update).")
     parser.add_argument("--scan_wl_h", type=int, default=2, help="WL subtree kernel iterations for scan mapping")
