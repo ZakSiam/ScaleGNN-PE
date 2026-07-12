@@ -26,10 +26,11 @@ import numpy as np
 # Optional: SciPy speeds up WL-kernel computation via sparse CSR matrices.
 # We do NOT require SciPy; if it is missing we compute the kernel exactly via dict dot-products.
 try:
-    from scipy.sparse import csr_matrix  # type: ignore
+    from scipy.sparse import csr_matrix, diags as _sp_diags  # type: ignore
     _HAS_SCIPY = True
 except Exception:  # pragma: no cover
     csr_matrix = None  # type: ignore
+    _sp_diags = None  # type: ignore
     _HAS_SCIPY = False
 
 
@@ -51,18 +52,30 @@ def _node_base_labels_from_features(feat_mat: np.ndarray) -> List[str]:
     return ["q:" + ",".join(map(str, row.tolist())) for row in q]
 
 
-def wl_subtree_feature_dicts(graphs: Sequence, h: int = 2) -> List[Dict[str, int]]:
+def wl_subtree_feature_dicts(graphs: Sequence, h: int = 2) -> List[Dict[int, int]]:
     """
-    Compute WL subtree features (counts of node labels) for each graph.
+    Compute WL subtree features (counts of node labels) for each graph, using integer
+    label hashing instead of ever-growing string tokens.
+
+    This is mathematically identical to the classic string-token WL kernel — the kernel
+    K = <phi_i, phi_j> is invariant to any *consistent* relabeling of tokens — but it avoids
+    the geometric blow-up in token length as h grows: each WL label is compressed to a small
+    integer id shared across all graphs, so cost stays linear in the true WL work rather than
+    in the (exponentially growing) string length.
 
     graphs: sequence of Graph objects with attributes:
         - num_nodes
         - adj_mat : (n,n) numpy array with 0/1 entries
         - feat_mat : (n,d) numpy array
 
-    Returns: list of dicts, one per graph, mapping WL-label tokens to counts.
+    Returns: list of dicts, one per graph, mapping integer WL-token ids to counts.
     """
-    feats: List[Dict[str, int]] = []
+    n_graphs = len(graphs)
+
+    # --- Precompute neighbor lists and compress base (h=0) labels to integer ids. ---
+    base_dict: Dict[str, int] = {}
+    graph_neigh: List[List[List[int]]] = []
+    cur_labels: List[List[int]] = []
     for g in graphs:
         n = int(g.num_nodes)
         adj = np.asarray(g.adj_mat)
@@ -72,28 +85,43 @@ def wl_subtree_feature_dicts(graphs: Sequence, h: int = 2) -> List[Dict[str, int
             for i in range(n):
                 if i not in neigh[i]:
                     neigh[i].append(i)
+        graph_neigh.append(neigh)
+        base = _node_base_labels_from_features(np.asarray(g.feat_mat))
+        cur_labels.append([base_dict.setdefault(lb, len(base_dict)) for lb in base])
 
-        labels = _node_base_labels_from_features(np.asarray(g.feat_mat))
-        # Count base labels
-        feat_dict: Dict[str, int] = {}
-        for lb in labels:
-            feat_dict[f"0:{lb}"] = feat_dict.get(f"0:{lb}", 0) + 1
+    # Feature-token ids are namespaced by WL iteration via token_dict[(it, label_id)] so that
+    # a label reused numerically in different rounds never collides in feature space. This
+    # reproduces the original per-round "it:" string prefix exactly.
+    feats: List[Dict[int, int]] = [dict() for _ in range(n_graphs)]
+    token_dict: Dict[Tuple[int, int], int] = {}
 
-        # WL iterations
-        cur = labels
-        for it in range(1, h + 1):
-            new = []
-            for i in range(n):
-                multiset = sorted(cur[j] for j in neigh[i])
-                token = f"{cur[i]}|" + "|".join(multiset)
-                # Use a stable hash-like token (string) – DictVectorizer will map to columns
-                new.append(token)
-            cur = new
-            for lb in cur:
-                key = f"{it}:{lb}"
-                feat_dict[key] = feat_dict.get(key, 0) + 1
+    def _accumulate(it: int) -> None:
+        for gi in range(n_graphs):
+            fd = feats[gi]
+            for lb in cur_labels[gi]:
+                tok = token_dict.setdefault((it, lb), len(token_dict))
+                fd[tok] = fd.get(tok, 0) + 1
 
-        feats.append(feat_dict)
+    # h = 0: base labels
+    _accumulate(0)
+
+    # WL relabeling iterations. `compress` is fresh per iteration (standard WL): two nodes get
+    # the same new id iff they share (center label, sorted multiset of neighbor labels), which
+    # by induction holds iff they shared the same grown string label in the original code.
+    for it in range(1, h + 1):
+        compress: Dict[Tuple[int, Tuple[int, ...]], int] = {}
+        new_labels: List[List[int]] = []
+        for gi in range(n_graphs):
+            cur = cur_labels[gi]
+            neigh = graph_neigh[gi]
+            nl = [0] * len(cur)
+            for i in range(len(cur)):
+                key = (cur[i], tuple(sorted(cur[j] for j in neigh[i])))
+                nl[i] = compress.setdefault(key, len(compress))
+            new_labels.append(nl)
+        cur_labels = new_labels
+        _accumulate(it)
+
     return feats
 
 
@@ -341,6 +369,107 @@ def pivoted_cholesky(K: np.ndarray, m: int, tol: float = 1e-12) -> List[int]:
     return pivots
 
 
+# ---------------------------------------------------------------------------
+# Matrix-free path: never materialize the dense N x N kernel.
+#
+# The WL kernel is K = X X^T for a sparse WL-count feature matrix X (rows = graphs,
+# cols = WL tokens). Pivoted Cholesky and nearest-rep assignment only ever touch the
+# diagonal of K and a handful of its COLUMNS, and each column is one sparse matvec
+# K[:, p] = X @ X[p]^T. So for large N we keep X sparse (~O(nnz), hundreds of MB at 1M)
+# and compute the O(m) needed columns on demand, instead of a dense N x N array (4 TB at 1M).
+# These routines reproduce pivoted_cholesky / assign_to_reps bit-for-bit; only the source
+# of each kernel column differs.
+# ---------------------------------------------------------------------------
+
+
+def wl_feature_matrix(graphs: Sequence, h: int = 2, normalize: bool = True, dtype=np.float64):
+    """
+    Build the sparse WL-count feature matrix X (n x vocab) as a scipy CSR matrix, WITHOUT
+    forming K. If normalize=True, rows are scaled to unit L2 norm so that K = X X^T has a
+    unit diagonal — matching wl_kernel_matrix(normalize=True).
+    """
+    if not _HAS_SCIPY:
+        raise RuntimeError("wl_feature_matrix requires scipy (matrix-free scan path).")
+    feat_dicts = wl_subtree_feature_dicts(graphs, h=int(h))
+    n = len(feat_dicts)
+
+    vocab: Dict[int, int] = {}
+    for d in feat_dicts:
+        for k in d.keys():
+            if k not in vocab:
+                vocab[k] = len(vocab)
+    p = len(vocab)
+
+    nnz = sum(len(d) for d in feat_dicts)
+    indptr = np.zeros(n + 1, dtype=np.int64)
+    indices = np.empty(nnz, dtype=np.int64)
+    data = np.empty(nnz, dtype=np.float64)
+    pos = 0
+    for i, d in enumerate(feat_dicts):
+        for k, v in d.items():
+            indices[pos] = vocab[k]
+            data[pos] = float(v)
+            pos += 1
+        indptr[i + 1] = pos
+
+    X = csr_matrix((data, indices, indptr), shape=(n, p), dtype=np.float64)
+    if normalize:
+        sq = np.asarray(X.multiply(X).sum(axis=1)).ravel()
+        inv = 1.0 / np.sqrt(np.maximum(sq, 1e-12))
+        X = csr_matrix(_sp_diags(inv) @ X)
+    return X.astype(dtype)
+
+
+def _wl_kernel_column(X, p: int) -> np.ndarray:
+    """Dense column p of K = X X^T, i.e. K[:, p] = X @ X[p]^T, via one sparse matvec."""
+    col = X @ X.getrow(int(p)).transpose()      # (n, 1) sparse
+    return np.asarray(col.todense(), dtype=np.float64).ravel()
+
+
+def pivoted_cholesky_matfree(X, m: int, tol: float = 1e-12) -> List[int]:
+    """
+    Matrix-free greedy pivoted Cholesky on K = X X^T. Identical to pivoted_cholesky(K, m)
+    but computes each of the m needed kernel columns on demand from the sparse X, so it
+    never allocates the N x N kernel. Memory: sparse X + one (n x m) factor L.
+    """
+    n = X.shape[0]
+    m = int(min(max(m, 1), n))
+    d = np.asarray(X.multiply(X).sum(axis=1)).ravel().astype(np.float64)  # residual variances = diag(K)
+    L = np.zeros((n, m), dtype=np.float64)
+    pivots: List[int] = []
+    for t in range(m):
+        p = int(np.argmax(d))
+        if d[p] <= tol:
+            break
+        pivots.append(p)
+        col = _wl_kernel_column(X, p)
+        if t > 0:
+            col = col - L[:, :t] @ L[p, :t]
+        ell = col / np.sqrt(d[p])
+        L[:, t] = ell
+        d = np.clip(d - ell * ell, 0.0, None)
+        d[p] = 0.0
+    return pivots
+
+
+def assign_to_reps_matfree(X, reps: Sequence[int]) -> np.ndarray:
+    """Matrix-free version of assign_to_reps: nearest rep by kernel distance, columns on demand."""
+    reps = list(map(int, reps))
+    n = X.shape[0]
+    diag = np.asarray(X.multiply(X).sum(axis=1)).ravel().astype(np.float64)
+    rep_of = np.empty(n, dtype=np.int32)
+    best_d2 = np.full(n, np.inf, dtype=np.float64)
+    for r in reps:
+        kr = _wl_kernel_column(X, r)
+        d2 = diag + diag[r] - 2.0 * kr
+        mask = d2 < best_d2
+        best_d2[mask] = d2[mask]
+        rep_of[mask] = r
+    for r in reps:
+        rep_of[r] = r
+    return rep_of
+
+
 @dataclass
 class ScanIndexer:
     """
@@ -362,12 +491,39 @@ def build_scan_indexer(
     kmeans_k: int,
     kmeans_iter: int,
     pivchol_m: int = 300,
+    matfree: Optional[bool] = None,
+    matfree_threshold: int = 20000,
     random_state: Optional[np.random.RandomState] = None,
 ) -> ScanIndexer:
     """
     Build ScanIndexer for a given graph domain.
+
+    For method="pivchol" on large domains we use the matrix-free path (no dense N x N kernel).
+    `matfree=None` auto-enables it when len(graphs) > matfree_threshold; pass True/False to force.
+    Only pivchol supports matrix-free — fft and graph_kmeans need the full kernel.
     """
     method = str(method).lower()
+
+    # ---- pivoted Cholesky: matrix-free for large N (never build dense K) ----
+    if method == "pivchol":
+        n = len(graphs)
+        use_matfree = (n > int(matfree_threshold)) if matfree is None else bool(matfree)
+        if use_matfree:
+            if not _HAS_SCIPY:
+                raise RuntimeError("Matrix-free pivchol requires scipy; install scipy or pass matfree=False.")
+            X = wl_feature_matrix(graphs, h=int(wl_h), normalize=True)
+            reps = pivoted_cholesky_matfree(X, m=int(pivchol_m))
+            rep_of = assign_to_reps_matfree(X, reps)
+            meta = {"wl_h": int(wl_h), "pivchol_m": len(reps), "matfree": True}
+            return ScanIndexer(method="pivchol", reps=reps, rep_of=rep_of, meta=meta)
+        # Dense path (small N): bit-for-bit identical to the original implementation.
+        K = wl_kernel_matrix(graphs, h=int(wl_h), normalize=True, dtype=np.float32)
+        reps = pivoted_cholesky(K, m=int(pivchol_m))
+        rep_of = assign_to_reps(K, reps)
+        meta = {"wl_h": int(wl_h), "pivchol_m": len(reps), "matfree": False}
+        return ScanIndexer(method="pivchol", reps=reps, rep_of=rep_of, meta=meta)
+
+    # ---- fft / graph_kmeans: require the dense kernel ----
     K = wl_kernel_matrix(graphs, h=int(wl_h), normalize=True, dtype=np.float32)
 
     if method == "fft":
@@ -387,14 +543,5 @@ def build_scan_indexer(
             rep_of[m] = m
         meta = {"wl_h": int(wl_h), "kmeans_k": int(kmeans_k), "kmeans_iter": int(kmeans_iter)}
         return ScanIndexer(method="graph_kmeans", reps=medoids, rep_of=rep_of, meta=meta)
-
-    if method == "pivchol":
-        # Greedy pivoted Cholesky selection on the WL kernel. Reps minimize kernel
-        # reconstruction error (trace of residual); hard nearest-rep assignment uses the
-        # SAME assign_to_reps machinery as fft, so this isolates the SELECTION rule.
-        reps = pivoted_cholesky(K, m=int(pivchol_m))
-        rep_of = assign_to_reps(K, reps)
-        meta = {"wl_h": int(wl_h), "pivchol_m": len(reps)}
-        return ScanIndexer(method="pivchol", reps=reps, rep_of=rep_of, meta=meta)
 
     raise ValueError(f"Unknown scan method: {method}. Use 'fft', 'graph_kmeans', or 'pivchol'.")

@@ -98,6 +98,8 @@ def run_one(args, train_mode: str):
             fft_m=args.scan_fft_m,
             kmeans_k=args.scan_kmeans_k,
             kmeans_iter=args.scan_kmeans_iter,
+            pivchol_m=args.scan_pivchol_m,
+            matfree=(None if args.scan_matfree == "auto" else (args.scan_matfree == "true")),
             random_state=algo_rds,
         )
 
@@ -128,6 +130,7 @@ def run_one(args, train_mode: str):
         reuse_optimizer=args.reuse_optimizer,
         scan_indexer=scan_indexer,
         scan_apply_to=getattr(args, 'domain_scan_apply_to', 'both'),
+        lazy_grads=args.lazy_grads,
     )
 
     t0 = time.time()
@@ -355,6 +358,11 @@ if __name__ == "__main__":
     parser.add_argument("--scan_fft_m", type=int, default=300, help="FFT shortlist size (representatives)")
     parser.add_argument("--scan_kmeans_k", type=int, default=300, help="Graph k-means clusters (kernel k-means)")
     parser.add_argument("--scan_kmeans_iter", type=int, default=8, help="Kernel k-means iterations")
+    parser.add_argument("--scan_pivchol_m", type=int, default=300, help="Pivoted-Cholesky representative count (reps)")
+    parser.add_argument("--scan_matfree", type=str, default="auto", choices=["auto", "true", "false"],
+                        help="Matrix-free pivchol (no dense NxN kernel): auto=enable when N>20k, true/false to force.")
+    parser.add_argument("--lazy_grads", type=str2bool, default=True,
+                        help="Compute f0 NTK gradients lazily (only for queried reps/arms) instead of all N up front.")
 
     args = parser.parse_args()
     main(args)

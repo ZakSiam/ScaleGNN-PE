@@ -86,7 +86,7 @@ class GnnUCB(UCBalg):  # Our main method
                  alg_lambda: float = 1, exploration_coef: float = 1, t_intersect: int = np.inf,
                  num_mlp_layers: int = 2, neuron_per_layer: int = 128, lr: float = 1e-3,
                  nn_aggr_feat = True, train_from_scratch = False, verbose = True,
-                 nn_init_lazy: bool = True, complete_cov_mat: bool = False, random_state = None, path: Optional[str] = None, scan_indexer=None, **kwargs):
+                 nn_init_lazy: bool = True, complete_cov_mat: bool = False, random_state = None, path: Optional[str] = None, scan_indexer=None, lazy_grads: bool = True, **kwargs):
         super().__init__(net=net, feat_dim=feat_dim, num_mlp_layers=num_mlp_layers, alg_lambda=alg_lambda, verbose = verbose,
                          lr = lr, complete_cov_mat = complete_cov_mat, nn_aggr_feat = nn_aggr_feat, train_from_scratch = train_from_scratch, num_nodes=num_nodes,
                          exploration_coef=exploration_coef, neuron_per_layer=neuron_per_layer, random_state=random_state, path=path, **kwargs)
@@ -113,20 +113,44 @@ class GnnUCB(UCBalg):  # Our main method
         self.num_actions = num_actions
         self.action_domain = action_domain
 
+        # Gradient (NTK feature) storage. The f0 gradients are FIXED (f0 is frozen), so each
+        # g[idx] is a constant and can be computed lazily and cached. In lazy mode we avoid
+        # materializing all N gradient vectors up front (N x num_net_params ~ 72 GB at N=1M);
+        # only the indices actually queried (reps + selected arms in scan 'both' mode) are
+        # ever computed. Lazy mode is behavior-identical to eager — it just defers/reuses work.
+        self.lazy_grads = bool(lazy_grads)
+        self._grad_cache = {}
         self.init_grad_list = []
-        self.get_init_grads()
+        if not self.lazy_grads:
+            self.get_init_grads()
 
     def save_model(self):
         super().save_model()
         torch.save(self.f0, self.path + "/f0_model")
 
+    def _compute_grad(self, idx):
+        """Compute the (fixed) f0 gradient / NTK feature vector for a single action index."""
+        self.f0.zero_grad()
+        out = self.f0(self.action_domain[idx])
+        out.backward()
+        return torch.cat([p.grad.flatten().detach() for p in self.f0.parameters()])
+
+    def _get_grad(self, idx):
+        """Return g[idx], from the eager list if present, else from a lazily-populated cache."""
+        if self.init_grad_list:
+            return self.init_grad_list[idx]
+        g = self._grad_cache.get(idx)
+        if g is None:
+            g = self._compute_grad(idx)
+            self._grad_cache[idx] = g
+        return g
+
     def get_init_grads(self):
-        post_mean0 = []
+        # Eager path (lazy_grads=False): precompute and store gradients for ALL actions.
         for graph in self.action_domain:
             self.f0.zero_grad()
-            post_mean0.append(self.f0(graph))
-            post_mean0[-1].backward(retain_graph=True)
-            # Get the Variance.
+            out = self.f0(graph)
+            out.backward()
             g = torch.cat([p.grad.flatten().detach() for p in self.f0.parameters()])
             self.init_grad_list.append(g)
 
@@ -158,13 +182,14 @@ class GnnUCB(UCBalg):  # Our main method
                 # self.U_inv_small = torch.inverse(
                 #     torch.diag(torch.ones(self.G.shape[0]).to(device) * self.alg_lambda) + kernel_matrix)
             else:
-                self.U += self.init_grad_list[idx] * self.init_grad_list[idx] / self.neuron_per_layer  # U is diagonal
+                g_idx = self._get_grad(idx)
+                self.U += g_idx * g_idx / self.neuron_per_layer  # U is diagonal
 
     def select(self):
         ucbs = []
         for ix in range(self.num_actions):
             post_mean = self.func(self.action_domain[ix])
-            g = self.init_grad_list[ix]
+            g = self._get_grad(ix)
             if self.complete_cov_mat:
                 raise NotImplementedError
                 # if self.G is None:
@@ -200,7 +225,7 @@ class GnnUCB(UCBalg):  # Our main method
         return ix
 
     def get_post_var(self, idx):
-        g = self.init_grad_list[idx]
+        g = self._get_grad(idx)
         if self.complete_cov_mat:
             raise NotImplementedError
         else:
@@ -347,7 +372,7 @@ class PhasedGnnUCB(GnnUCB):
             vars = []
             for ix in range(self.num_actions):
                 post_mean = self.func(self.action_domain[ix])
-                g = self.init_grad_list[ix]
+                g = self._get_grad(ix)
                 post_var = torch.sqrt(torch.sum(g * g / self.U) / self.neuron_per_layer)
                 v = post_var.item()
                 m = post_mean.item()
@@ -388,7 +413,7 @@ class PhasedGnnUCB(GnnUCB):
             vars = []
             for ix in range(self.num_actions):
                 post_mean = self.func(self.action_domain[ix])
-                g = self.init_grad_list[ix]
+                g = self._get_grad(ix)
                 post_var = torch.sqrt(torch.sum(g * g / self.U) / self.neuron_per_layer)
                 v = post_var.item()
                 m = post_mean.item()
@@ -426,7 +451,7 @@ class PhasedGnnUCB(GnnUCB):
         var_rep = np.zeros(self.num_actions, dtype=np.float64)
         for r in reps:
             post_mean = self.func(self.action_domain[r])
-            g = self.init_grad_list[r]
+            g = self._get_grad(r)
             post_var = torch.sqrt(torch.sum(g * g / self.U) / self.neuron_per_layer)
             mean_rep[r] = post_mean.item()
             var_rep[r] = post_var.item()
@@ -460,7 +485,7 @@ class PhasedGnnUCB(GnnUCB):
 
         # Exact (C.1): compute variance exactly for maximizers (no GNN forward needed here).
         def _exact_var(i: int) -> float:
-            g = self.init_grad_list[i]
+            g = self._get_grad(i)
             post_var = torch.sqrt(torch.sum(g * g / self.U) / self.neuron_per_layer)
             return float(post_var.item())
 
