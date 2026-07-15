@@ -2,6 +2,7 @@ import numpy as np
 import torch.optim as optim
 import copy
 from nets import NN, GNN, normalize_init
+from peft_nets import apply_peft
 from typing import Optional
 from config import *
 
@@ -72,7 +73,10 @@ class UCBalg:
 
     def _build_optimizer(self):
         # Default: Adam without weight decay (matching the paper's practical setup).
-        return optim.Adam(self.func.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        # Optimize only trainable params. Identical to self.func.parameters() when nothing is
+        # frozen (peft='none'); under PEFT this trains only the adapter/head params.
+        params = [p for p in self.func.parameters() if p.requires_grad]
+        return optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
 
     def _get_optimizer(self, reset: bool = False):
         if (not self.reuse_optimizer) or (self._optimizer is None) or reset:
@@ -86,7 +90,8 @@ class GnnUCB(UCBalg):  # Our main method
                  alg_lambda: float = 1, exploration_coef: float = 1, t_intersect: int = np.inf,
                  num_mlp_layers: int = 2, neuron_per_layer: int = 128, lr: float = 1e-3,
                  nn_aggr_feat = True, train_from_scratch = False, verbose = True,
-                 nn_init_lazy: bool = True, complete_cov_mat: bool = False, random_state = None, path: Optional[str] = None, scan_indexer=None, lazy_grads: bool = True, **kwargs):
+                 nn_init_lazy: bool = True, complete_cov_mat: bool = False, random_state = None, path: Optional[str] = None, scan_indexer=None, lazy_grads: bool = True,
+                 peft: str = 'none', lora_rank: int = 8, lora_alpha: float = 16.0, peft_uncertainty: bool = True, **kwargs):
         super().__init__(net=net, feat_dim=feat_dim, num_mlp_layers=num_mlp_layers, alg_lambda=alg_lambda, verbose = verbose,
                          lr = lr, complete_cov_mat = complete_cov_mat, nn_aggr_feat = nn_aggr_feat, train_from_scratch = train_from_scratch, num_nodes=num_nodes,
                          exploration_coef=exploration_coef, neuron_per_layer=neuron_per_layer, random_state=random_state, path=path, **kwargs)
@@ -99,6 +104,27 @@ class GnnUCB(UCBalg):  # Our main method
         if nn_init_lazy:
             self.func = normalize_init(self.func)
             self.f0 = copy.deepcopy(self.func)
+
+        # --- PEFT: parameter-space compression (axis 2). Default 'none' => full fine-tuning,
+        # identical to the original behavior. Under PEFT we freeze the base weights so the
+        # optimizer trains only a small set S, and (when peft_uncertainty) the frozen f0 used for
+        # NTK features shares the same frozen set, so g and U live in |S| dims instead of ~4.2M.
+        self.peft = str(peft).lower()
+        self.lora_rank = int(lora_rank)
+        self.lora_alpha = float(lora_alpha)
+        self.peft_uncertainty = bool(peft_uncertainty)
+        if self.peft != 'none':
+            self.func = apply_peft(self.func, method=self.peft, lora_rank=self.lora_rank,
+                                   lora_alpha=self.lora_alpha).to(device)
+            # f0 provides the (fixed) NTK features for the posterior variance.
+            self.f0 = copy.deepcopy(self.func)
+            if not self.peft_uncertainty:
+                # Ablation: train PEFT params but measure uncertainty over ALL params.
+                for p in self.f0.parameters():
+                    p.requires_grad_(True)
+            # Resize the NTK dimension and reset U over the (possibly reduced) trainable set of f0.
+            self.num_net_params = sum(p.numel() for p in self.f0.parameters() if p.requires_grad)
+            self.U = self.alg_lambda * torch.ones((self.num_net_params,)).to(device)
 
         if net == 'NN':
             self.name = 'NN-UCB'
@@ -133,7 +159,9 @@ class GnnUCB(UCBalg):  # Our main method
         self.f0.zero_grad()
         out = self.f0(self.action_domain[idx])
         out.backward()
-        return torch.cat([p.grad.flatten().detach() for p in self.f0.parameters()])
+        # Only trainable params carry a gradient; under PEFT the frozen base params have grad=None.
+        # When nothing is frozen (peft='none') this is every parameter, i.e. unchanged behavior.
+        return torch.cat([p.grad.flatten().detach() for p in self.f0.parameters() if p.requires_grad])
 
     def _get_grad(self, idx):
         """Return g[idx], from the eager list if present, else from a lazily-populated cache."""
@@ -151,7 +179,7 @@ class GnnUCB(UCBalg):  # Our main method
             self.f0.zero_grad()
             out = self.f0(graph)
             out.backward()
-            g = torch.cat([p.grad.flatten().detach() for p in self.f0.parameters()])
+            g = torch.cat([p.grad.flatten().detach() for p in self.f0.parameters() if p.requires_grad])
             self.init_grad_list.append(g)
 
     # def get_small_cov(self, g: np.ndarray):
