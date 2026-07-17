@@ -363,7 +363,7 @@ class PhasedGnnUCB(GnnUCB):
                  alg_lambda: float = 1, exploration_coef: float = 1, t_intersect: int= np.inf,
                  num_mlp_layers: int = 2, neuron_per_layer: int = 128, lr: float = 1e-3,
                  nn_aggr_feat = True, train_from_scratch = False, verbose = True,
-                 nn_init_lazy: bool = True, complete_cov_mat: bool = False, random_state = None, path: Optional[str] = None, scan_indexer=None, scan_apply_to: str = 'both', **kwargs):
+                 nn_init_lazy: bool = True, complete_cov_mat: bool = False, random_state = None, path: Optional[str] = None, scan_indexer=None, scan_apply_to: str = 'both', scan_tie_break: str = 'first', **kwargs):
         super().__init__(net = net, num_nodes = num_nodes, feat_dim = feat_dim, num_actions = num_actions, action_domain = action_domain,
         alg_lambda = alg_lambda, exploration_coef = exploration_coef,
         num_mlp_layers = num_mlp_layers, neuron_per_layer = neuron_per_layer, lr = lr,
@@ -373,10 +373,40 @@ class PhasedGnnUCB(GnnUCB):
         self.t_intersect = t_intersect
         self.scan_indexer = scan_indexer
         self.scan_apply_to = str(scan_apply_to).lower()
+        self.scan_tie_break = str(scan_tie_break).lower()
+        if self.scan_tie_break not in {"first", "random"}:
+            raise ValueError(f"scan_tie_break must be 'first' or 'random', got: {scan_tie_break}")
         if net == 'NN':
             self.name = 'PhasedNN-UCB'
         else:
             self.name = 'PhasedGNN-UCB'
+
+    def _argmax_maximizers(self, values) -> int:
+        """
+        argmax of `values` over self.maximizers, with an explicit tie policy.
+
+        Why this exists: under a scan approximation every arm mapped to the same
+        representative receives a byte-identical value, so this argmax is routinely a tie
+        among several arms. Python's max() resolves ties by list order, which means the
+        lowest-indexed arm of the winning cluster is always chosen and the variance signal
+        does no work — the same arm is then re-queried round after round.
+
+        Under an exact full scan the values are distinct floats and ties essentially never
+        occur, so this reduces to plain argmax. That asymmetry makes the tie policy a
+        confound when comparing exact vs approximated runs, hence the flag:
+          - "first"  : original behaviour (lowest-indexed tied arm). Default.
+          - "random" : sample uniformly among the tied arms, via the algorithm's own RNG.
+
+        Ties are compared with exact equality on purpose: under nearest-rep copying the tied
+        values are bit-identical copies, so no tolerance is needed or wanted.
+        """
+        cand = list(self.maximizers)
+        vals = np.asarray([float(values[i]) for i in cand], dtype=np.float64)
+        best = vals.max()
+        tied = [c for c, v in zip(cand, vals) if v == best]
+        if len(tied) == 1 or self.scan_tie_break == "first":
+            return int(tied[0])
+        return int(tied[self._rds.randint(len(tied))])
 
     def select(self):
         """
@@ -431,6 +461,15 @@ class PhasedGnnUCB(GnnUCB):
         rep_of = self.scan_indexer.rep_of  # shape (num_actions,)
         sqrt_beta = float(np.sqrt(self.exploration_coef))
 
+        def _spread(vals_at_reps: np.ndarray) -> np.ndarray:
+            """
+            Reconstruct a per-arm quantity from its values at the representatives: copy each
+            rep's value to the arms assigned to it. `vals_at_reps` is ordered to match `reps`.
+            """
+            full = np.zeros(self.num_actions, dtype=np.float64)
+            full[np.asarray(reps, dtype=np.int64)] = vals_at_reps
+            return full[np.asarray(rep_of, dtype=np.int64)]
+
         # -------------------------
         # (C.2) maximizer update
         # -------------------------
@@ -465,51 +504,42 @@ class PhasedGnnUCB(GnnUCB):
                 ix = self.maximizers[int(np.argmax(maximizer_vars))]
                 return int(ix)
 
-            # Approx (C.1): map each arm to its representative's variance.
+            # Approx (C.1): reconstruct each arm's variance from the representatives only.
             vars_arr = np.asarray(vars, dtype=np.float64)
-            def _approx_var(i: int) -> float:
-                r = int(rep_of[i])
-                return float(vars_arr[r])
+            approx_var = _spread(vars_arr[np.asarray(reps, dtype=np.int64)])
+            return self._argmax_maximizers(approx_var)
 
-            ix = max(self.maximizers, key=_approx_var)
-            return int(ix)
-
-        # Approximate (C.2): evaluate mean/var only on reps and share across mapped arms.
-        mean_rep = np.zeros(self.num_actions, dtype=np.float64)
-        var_rep = np.zeros(self.num_actions, dtype=np.float64)
-        for r in reps:
+        # Approximate (C.2): evaluate mean/var only on reps, then reconstruct over the domain.
+        # mean_m / var_m are compact (m,) vectors ordered to match `reps`.
+        mean_m = np.zeros(len(reps), dtype=np.float64)
+        var_m = np.zeros(len(reps), dtype=np.float64)
+        for j, r in enumerate(reps):
             post_mean = self.func(self.action_domain[r])
             g = self._get_grad(r)
             post_var = torch.sqrt(torch.sum(g * g / self.U) / self.neuron_per_layer)
-            mean_rep[r] = post_mean.item()
-            var_rep[r] = post_var.item()
+            mean_m[j] = post_mean.item()
+            var_m[j] = post_var.item()
 
-        def _ucb(i: int) -> float:
-            r = int(rep_of[i])
-            return float(mean_rep[r] + sqrt_beta * var_rep[r])
-
-        def _lcb(i: int) -> float:
-            r = int(rep_of[i])
-            return float(mean_rep[r] - sqrt_beta * var_rep[r])
+        mean_all = _spread(mean_m)
+        var_all = _spread(var_m)
+        ucb_all = mean_all + sqrt_beta * var_all
+        lcb_all = mean_all - sqrt_beta * var_all
 
         # Update maximizers (approximate)
         if t > self.t_intersect:
-            max_lcb = max(_lcb(i) for i in self.maximizers)
-            self.maximizers = [i for i in self.maximizers if max_lcb <= _ucb(i)]
+            cand = np.asarray(self.maximizers, dtype=np.int64)
+            max_lcb = float(np.max(lcb_all[cand]))
+            self.maximizers = [i for i in self.maximizers if max_lcb <= ucb_all[i]]
         else:
-            max_lcb = max(_lcb(i) for i in range(self.num_actions))
-            self.maximizers = [i for i in range(self.num_actions) if max_lcb <= _ucb(i)]
+            max_lcb = float(np.max(lcb_all))
+            self.maximizers = [i for i in range(self.num_actions) if max_lcb <= ucb_all[i]]
 
         # -------------------------
         # (C.1) next-arm selection
         # -------------------------
         if use_c1:
-            # Approx (C.1): pick by representative variance.
-            def _approx_var(i: int) -> float:
-                r = int(rep_of[i])
-                return float(var_rep[r])
-            ix = max(self.maximizers, key=_approx_var)
-            return int(ix)
+            # Approx (C.1): pick by reconstructed variance.
+            return self._argmax_maximizers(var_all)
 
         # Exact (C.1): compute variance exactly for maximizers (no GNN forward needed here).
         def _exact_var(i: int) -> float:
