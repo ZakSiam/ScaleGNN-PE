@@ -144,6 +144,7 @@ def run_one(args, train_mode: str):
         reuse_optimizer=args.reuse_optimizer,
         scan_indexer=scan_indexer,
         scan_apply_to=getattr(args, 'domain_scan_apply_to', 'both'),
+        scan_tie_break=getattr(args, 'scan_tie_break', 'first'),
         lazy_grads=args.lazy_grads,
         # --- PEFT (parameter-space compression) ---
         peft=peft,
@@ -401,6 +402,11 @@ if __name__ == "__main__":
     parser.add_argument("--scan_kmeans_iter", type=int, default=8)
     parser.add_argument("--scan_pivchol_m", type=int, default=300)
     parser.add_argument("--scan_matfree", type=str, default="auto", choices=["auto", "true", "false"])
+    parser.add_argument("--scan_tie_break", type=str, default="first", choices=["first", "random"],
+                        help="Tie policy for the (C.1) argmax under scan approximation. A scan maps a "
+                             "whole cluster to the SAME variance, so ties are common: first=lowest-indexed "
+                             "tied arm (original behaviour, re-picks the same arm each round), "
+                             "random=uniform among tied arms (breaks the repeat, fairer vs exact scan).")
     parser.add_argument("--lazy_grads", type=str2bool, default=True)
 
     # PEFT (parameter-space compression) ablations (apply to finetune only)
