@@ -34,7 +34,6 @@ except Exception:  # pragma: no cover
     _HAS_SCIPY = False
 
 
-
 def _node_base_labels_from_features(feat_mat: np.ndarray) -> List[str]:
     """
     Robust labeling for QM9 features without assuming a specific encoding.
@@ -377,8 +376,17 @@ def pivoted_cholesky(K: np.ndarray, m: int, tol: float = 1e-12) -> List[int]:
 # diagonal of K and a handful of its COLUMNS, and each column is one sparse matvec
 # K[:, p] = X @ X[p]^T. So for large N we keep X sparse (~O(nnz), hundreds of MB at 1M)
 # and compute the O(m) needed columns on demand, instead of a dense N x N array (4 TB at 1M).
-# These routines reproduce pivoted_cholesky / assign_to_reps bit-for-bit; only the source
-# of each kernel column differs.
+# These routines select the SAME pivots as pivoted_cholesky / assign_to_reps, but not
+# bit-for-bit: the dense path stores K in float32 while the matrix-free path works in
+# float64, so intermediate values differ in the last few ulps. Selections agree because
+# both paths share the unit-diagonal convention below (see `unit_diag`).
+#
+# That convention matters. wl_kernel_matrix(normalize=True) ends with fill_diagonal(K, 1.0),
+# so the dense residual diagonal starts at EXACTLY all-ones. Row-normalizing X instead leaves
+# ~1e-16 of rounding noise on diag(K) = ||X_i||^2. Since the first pivot is argmax over that
+# diagonal, the noise — not the data — would decide it, and the two paths would pick different
+# first pivots and diverge from step 0. Passing unit_diag=True snaps the matrix-free diagonal
+# (and the K[p,p] entry of each fetched column) to exactly 1.0, matching the dense path.
 # ---------------------------------------------------------------------------
 
 
@@ -420,21 +428,36 @@ def wl_feature_matrix(graphs: Sequence, h: int = 2, normalize: bool = True, dtyp
     return X.astype(dtype)
 
 
-def _wl_kernel_column(X, p: int) -> np.ndarray:
+def _wl_kernel_column(X, p: int, unit_diag: bool = False) -> np.ndarray:
     """Dense column p of K = X X^T, i.e. K[:, p] = X @ X[p]^T, via one sparse matvec."""
     col = X @ X.getrow(int(p)).transpose()      # (n, 1) sparse
-    return np.asarray(col.todense(), dtype=np.float64).ravel()
+    col = np.asarray(col.todense(), dtype=np.float64).ravel()
+    if unit_diag:
+        col[int(p)] = 1.0   # dense path does fill_diagonal(K, 1.0); match it exactly
+    return col
 
 
-def pivoted_cholesky_matfree(X, m: int, tol: float = 1e-12) -> List[int]:
+def _matfree_diag(X, unit_diag: bool = False) -> np.ndarray:
+    """diag(K) = ||X_i||^2, snapped to exactly 1.0 under the normalized convention."""
+    n = X.shape[0]
+    if unit_diag:
+        return np.ones(n, dtype=np.float64)
+    return np.asarray(X.multiply(X).sum(axis=1)).ravel().astype(np.float64)
+
+
+def pivoted_cholesky_matfree(X, m: int, tol: float = 1e-12, unit_diag: bool = False) -> List[int]:
     """
-    Matrix-free greedy pivoted Cholesky on K = X X^T. Identical to pivoted_cholesky(K, m)
-    but computes each of the m needed kernel columns on demand from the sparse X, so it
-    never allocates the N x N kernel. Memory: sparse X + one (n x m) factor L.
+    Matrix-free greedy pivoted Cholesky on K = X X^T. Selects the same pivots as
+    pivoted_cholesky(K, m) but computes each of the m needed kernel columns on demand from
+    the sparse X, so it never allocates the N x N kernel. Memory: sparse X + one (n x m) L.
+
+    Set unit_diag=True when X was built with normalize=True, so diag(K) is treated as
+    exactly 1.0 — matching wl_kernel_matrix's fill_diagonal and keeping the first pivot
+    deterministic instead of decided by float noise.
     """
     n = X.shape[0]
     m = int(min(max(m, 1), n))
-    d = np.asarray(X.multiply(X).sum(axis=1)).ravel().astype(np.float64)  # residual variances = diag(K)
+    d = _matfree_diag(X, unit_diag=unit_diag)   # residual variances = diag(K)
     L = np.zeros((n, m), dtype=np.float64)
     pivots: List[int] = []
     for t in range(m):
@@ -442,7 +465,7 @@ def pivoted_cholesky_matfree(X, m: int, tol: float = 1e-12) -> List[int]:
         if d[p] <= tol:
             break
         pivots.append(p)
-        col = _wl_kernel_column(X, p)
+        col = _wl_kernel_column(X, p, unit_diag=unit_diag)
         if t > 0:
             col = col - L[:, :t] @ L[p, :t]
         ell = col / np.sqrt(d[p])
@@ -452,15 +475,15 @@ def pivoted_cholesky_matfree(X, m: int, tol: float = 1e-12) -> List[int]:
     return pivots
 
 
-def assign_to_reps_matfree(X, reps: Sequence[int]) -> np.ndarray:
+def assign_to_reps_matfree(X, reps: Sequence[int], unit_diag: bool = False) -> np.ndarray:
     """Matrix-free version of assign_to_reps: nearest rep by kernel distance, columns on demand."""
     reps = list(map(int, reps))
     n = X.shape[0]
-    diag = np.asarray(X.multiply(X).sum(axis=1)).ravel().astype(np.float64)
+    diag = _matfree_diag(X, unit_diag=unit_diag)
     rep_of = np.empty(n, dtype=np.int32)
     best_d2 = np.full(n, np.inf, dtype=np.float64)
     for r in reps:
-        kr = _wl_kernel_column(X, r)
+        kr = _wl_kernel_column(X, r, unit_diag=unit_diag)
         d2 = diag + diag[r] - 2.0 * kr
         mask = d2 < best_d2
         best_d2[mask] = d2[mask]
@@ -512,15 +535,16 @@ def build_scan_indexer(
             if not _HAS_SCIPY:
                 raise RuntimeError("Matrix-free pivchol requires scipy; install scipy or pass matfree=False.")
             X = wl_feature_matrix(graphs, h=int(wl_h), normalize=True)
-            reps = pivoted_cholesky_matfree(X, m=int(pivchol_m))
-            rep_of = assign_to_reps_matfree(X, reps)
+            # normalize=True -> unit diagonal convention, same as the dense path.
+            reps = pivoted_cholesky_matfree(X, m=int(pivchol_m), unit_diag=True)
+            rep_of = assign_to_reps_matfree(X, reps, unit_diag=True)
             meta = {"wl_h": int(wl_h), "pivchol_m": len(reps), "matfree": True}
-            return ScanIndexer(method="pivchol", reps=reps, rep_of=rep_of, meta=meta)
-        # Dense path (small N): bit-for-bit identical to the original implementation.
-        K = wl_kernel_matrix(graphs, h=int(wl_h), normalize=True, dtype=np.float32)
-        reps = pivoted_cholesky(K, m=int(pivchol_m))
-        rep_of = assign_to_reps(K, reps)
-        meta = {"wl_h": int(wl_h), "pivchol_m": len(reps), "matfree": False}
+        else:
+            # Dense path (small N).
+            K = wl_kernel_matrix(graphs, h=int(wl_h), normalize=True, dtype=np.float32)
+            reps = pivoted_cholesky(K, m=int(pivchol_m))
+            rep_of = assign_to_reps(K, reps)
+            meta = {"wl_h": int(wl_h), "pivchol_m": len(reps), "matfree": False}
         return ScanIndexer(method="pivchol", reps=reps, rep_of=rep_of, meta=meta)
 
     # ---- fft / graph_kmeans: require the dense kernel ----

@@ -130,6 +130,7 @@ def run_one(args, train_mode: str):
         reuse_optimizer=args.reuse_optimizer,
         scan_indexer=scan_indexer,
         scan_apply_to=getattr(args, 'domain_scan_apply_to', 'both'),
+        scan_tie_break=getattr(args, 'scan_tie_break', 'first'),
         lazy_grads=args.lazy_grads,
     )
 
@@ -158,6 +159,7 @@ def run_one(args, train_mode: str):
             "domain_scan_method": scan_indexer.method,
             "domain_scan_meta": scan_indexer.meta,
             "domain_scan_num_reps": len(scan_indexer.reps),
+            "scan_tie_break": getattr(args, "scan_tie_break", "first"),
         })
     else:
         run_settings.update({
@@ -361,6 +363,10 @@ if __name__ == "__main__":
     parser.add_argument("--scan_pivchol_m", type=int, default=300, help="Pivoted-Cholesky representative count (reps)")
     parser.add_argument("--scan_matfree", type=str, default="auto", choices=["auto", "true", "false"],
                         help="Matrix-free pivchol (no dense NxN kernel): auto=enable when N>20k, true/false to force.")
+    parser.add_argument("--scan_tie_break", type=str, default="first", choices=["first", "random"],
+                        help="Tie policy for the (C.1) argmax. Scan approximations give whole clusters "
+                             "identical variance, so ties are common: first=lowest-indexed tied arm "
+                             "(original behaviour), random=uniform among tied arms.")
     parser.add_argument("--lazy_grads", type=str2bool, default=True,
                         help="Compute f0 NTK gradients lazily (only for queried reps/arms) instead of all N up front.")
 
