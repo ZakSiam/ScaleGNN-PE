@@ -18,6 +18,8 @@ Dependencies: numpy only. If scipy is available, we use scipy.sparse CSR for spe
 
 from __future__ import annotations
 
+import os
+import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -32,7 +34,6 @@ except Exception:  # pragma: no cover
     csr_matrix = None  # type: ignore
     _sp_diags = None  # type: ignore
     _HAS_SCIPY = False
-
 
 
 def _node_base_labels_from_features(feat_mat: np.ndarray) -> List[str]:
@@ -377,8 +378,17 @@ def pivoted_cholesky(K: np.ndarray, m: int, tol: float = 1e-12) -> List[int]:
 # diagonal of K and a handful of its COLUMNS, and each column is one sparse matvec
 # K[:, p] = X @ X[p]^T. So for large N we keep X sparse (~O(nnz), hundreds of MB at 1M)
 # and compute the O(m) needed columns on demand, instead of a dense N x N array (4 TB at 1M).
-# These routines reproduce pivoted_cholesky / assign_to_reps bit-for-bit; only the source
-# of each kernel column differs.
+# These routines select the SAME pivots as pivoted_cholesky / assign_to_reps, but not
+# bit-for-bit: the dense path stores K in float32 while the matrix-free path works in
+# float64, so intermediate values differ in the last few ulps. Selections agree because
+# both paths share the unit-diagonal convention below (see `unit_diag`).
+#
+# That convention matters. wl_kernel_matrix(normalize=True) ends with fill_diagonal(K, 1.0),
+# so the dense residual diagonal starts at EXACTLY all-ones. Row-normalizing X instead leaves
+# ~1e-16 of rounding noise on diag(K) = ||X_i||^2. Since the first pivot is argmax over that
+# diagonal, the noise — not the data — would decide it, and the two paths would pick different
+# first pivots and diverge from step 0. Passing unit_diag=True snaps the matrix-free diagonal
+# (and the K[p,p] entry of each fetched column) to exactly 1.0, matching the dense path.
 # ---------------------------------------------------------------------------
 
 
@@ -420,21 +430,36 @@ def wl_feature_matrix(graphs: Sequence, h: int = 2, normalize: bool = True, dtyp
     return X.astype(dtype)
 
 
-def _wl_kernel_column(X, p: int) -> np.ndarray:
+def _wl_kernel_column(X, p: int, unit_diag: bool = False) -> np.ndarray:
     """Dense column p of K = X X^T, i.e. K[:, p] = X @ X[p]^T, via one sparse matvec."""
     col = X @ X.getrow(int(p)).transpose()      # (n, 1) sparse
-    return np.asarray(col.todense(), dtype=np.float64).ravel()
+    col = np.asarray(col.todense(), dtype=np.float64).ravel()
+    if unit_diag:
+        col[int(p)] = 1.0   # dense path does fill_diagonal(K, 1.0); match it exactly
+    return col
 
 
-def pivoted_cholesky_matfree(X, m: int, tol: float = 1e-12) -> List[int]:
+def _matfree_diag(X, unit_diag: bool = False) -> np.ndarray:
+    """diag(K) = ||X_i||^2, snapped to exactly 1.0 under the normalized convention."""
+    n = X.shape[0]
+    if unit_diag:
+        return np.ones(n, dtype=np.float64)
+    return np.asarray(X.multiply(X).sum(axis=1)).ravel().astype(np.float64)
+
+
+def pivoted_cholesky_matfree(X, m: int, tol: float = 1e-12, unit_diag: bool = False) -> List[int]:
     """
-    Matrix-free greedy pivoted Cholesky on K = X X^T. Identical to pivoted_cholesky(K, m)
-    but computes each of the m needed kernel columns on demand from the sparse X, so it
-    never allocates the N x N kernel. Memory: sparse X + one (n x m) factor L.
+    Matrix-free greedy pivoted Cholesky on K = X X^T. Selects the same pivots as
+    pivoted_cholesky(K, m) but computes each of the m needed kernel columns on demand from
+    the sparse X, so it never allocates the N x N kernel. Memory: sparse X + one (n x m) L.
+
+    Set unit_diag=True when X was built with normalize=True, so diag(K) is treated as
+    exactly 1.0 — matching wl_kernel_matrix's fill_diagonal and keeping the first pivot
+    deterministic instead of decided by float noise.
     """
     n = X.shape[0]
     m = int(min(max(m, 1), n))
-    d = np.asarray(X.multiply(X).sum(axis=1)).ravel().astype(np.float64)  # residual variances = diag(K)
+    d = _matfree_diag(X, unit_diag=unit_diag)   # residual variances = diag(K)
     L = np.zeros((n, m), dtype=np.float64)
     pivots: List[int] = []
     for t in range(m):
@@ -442,7 +467,7 @@ def pivoted_cholesky_matfree(X, m: int, tol: float = 1e-12) -> List[int]:
         if d[p] <= tol:
             break
         pivots.append(p)
-        col = _wl_kernel_column(X, p)
+        col = _wl_kernel_column(X, p, unit_diag=unit_diag)
         if t > 0:
             col = col - L[:, :t] @ L[p, :t]
         ell = col / np.sqrt(d[p])
@@ -452,15 +477,109 @@ def pivoted_cholesky_matfree(X, m: int, tol: float = 1e-12) -> List[int]:
     return pivots
 
 
-def assign_to_reps_matfree(X, reps: Sequence[int]) -> np.ndarray:
+def kernel_kmeans_matfree(X, k: int, n_iter: int = 10,
+                          random_state: Optional[np.random.RandomState] = None,
+                          chunk: int = 50_000) -> np.ndarray:
+    """
+    Matrix-free kernel k-means on K = X X^T, never forming the N x N kernel.
+
+    The WL kernel has an explicit feature map (K = X X^T), so kernel k-means over K is
+    exactly Lloyd's k-means over the rows of X:
+
+        ||x_i - mu_c||^2 = ||x_i||^2 - 2 x_i.mu_c + ||mu_c||^2
+
+    The centroids mu_c = mean of the member rows are dense (k x vocab); the distance block
+    X @ M.T is computed in row chunks, so peak memory is O(k*vocab + chunk*k) instead of
+    O(n^2). Returns cluster assignments (n,), identical to kernel_kmeans(K, ...) given the
+    same random_state -- the init and the empty-cluster re-seeding below mirror it exactly.
+    """
+    if not _HAS_SCIPY:
+        raise RuntimeError("kernel_kmeans_matfree requires scipy (matrix-free scan path).")
+    n = X.shape[0]
+    k = int(min(max(k, 1), n))
+    rng = np.random.RandomState(0) if random_state is None else random_state
+    labels = rng.randint(0, k, size=n).astype(np.int32)
+
+    # ||x_i||^2 == diag(K); constant per row, so it never changes the argmin, but keep it
+    # so the reported distances match the dense path.
+    sq = _matfree_diag(X, unit_diag=True)
+
+    for _ in range(int(n_iter)):
+        sizes = np.bincount(labels, minlength=k).astype(np.float64)
+        empty = np.where(sizes < 1)[0]
+        if len(empty) > 0:
+            # Identical re-seeding to kernel_kmeans: move a point from the largest
+            # non-singleton cluster into each empty one, consuming rng draws in the
+            # same order so the two paths stay in lockstep.
+            for c in empty:
+                donors = np.where(sizes > 1)[0]
+                if donors.size == 0:
+                    perm = rng.permutation(n)
+                    labels[perm[:k]] = np.arange(k, dtype=np.int32)
+                    break
+                d = donors[int(np.argmax(sizes[donors]))]
+                donor_members = np.where(labels == d)[0]
+                idx = int(donor_members[rng.randint(0, len(donor_members))])
+                labels[idx] = int(c)
+                sizes[d] -= 1.0
+                sizes[c] += 1.0
+            sizes = np.bincount(labels, minlength=k).astype(np.float64)
+            if np.any(sizes < 1):
+                perm = rng.permutation(n)
+                labels[perm[:k]] = np.arange(k, dtype=np.int32)
+                sizes = np.bincount(labels, minlength=k).astype(np.float64)
+
+        # Centroids: M[c] = mean of rows in cluster c.  H is (k x n), so H @ X is (k x vocab).
+        H = csr_matrix((np.ones(n, dtype=np.float64), (labels, np.arange(n))), shape=(k, n))
+        M = csr_matrix(H @ X).multiply(1.0 / sizes[:, None]).tocsr()
+        msq = np.asarray(M.multiply(M).sum(axis=1)).ravel()   # ||mu_c||^2
+
+        new_labels = np.empty(n, dtype=np.int32)
+        for lo in range(0, n, int(chunk)):
+            hi = min(lo + int(chunk), n)
+            S = np.asarray((X[lo:hi] @ M.T).todense())        # (chunk, k)
+            d2 = sq[lo:hi, None] - 2.0 * S + msq[None, :]
+            d2 = np.nan_to_num(d2, nan=np.inf, posinf=np.inf, neginf=np.inf)
+            new_labels[lo:hi] = np.argmin(d2, axis=1)
+
+        if np.all(new_labels == labels):
+            break
+        labels = new_labels
+    return labels
+
+
+def cluster_medoids_matfree(X, labels: np.ndarray, k: int) -> List[int]:
+    """
+    Matrix-free version of cluster_medoids_from_kernel: medoid_c = argmax_{i in C} sum_{j in C} K_ij.
+
+    sum_{j in C} K_ij = x_i . (sum_{j in C} x_j), so one sparse cluster-sum vector per cluster
+    replaces the |C| x |C| kernel block.
+    """
+    if not _HAS_SCIPY:
+        raise RuntimeError("cluster_medoids_matfree requires scipy (matrix-free scan path).")
+    n = X.shape[0]
+    H = csr_matrix((np.ones(n, dtype=np.float64), (labels, np.arange(n))), shape=(int(k), n))
+    Ssum = csr_matrix(H @ X)                                  # (k x vocab) cluster sums
+    medoids: List[int] = []
+    for c in range(int(k)):
+        members = np.where(labels == c)[0]
+        if len(members) == 0:
+            medoids.append(int(c % n))
+            continue
+        sims = np.asarray((X[members] @ Ssum[c].T).todense()).ravel()
+        medoids.append(int(members[int(np.argmax(sims))]))
+    return medoids
+
+
+def assign_to_reps_matfree(X, reps: Sequence[int], unit_diag: bool = False) -> np.ndarray:
     """Matrix-free version of assign_to_reps: nearest rep by kernel distance, columns on demand."""
     reps = list(map(int, reps))
     n = X.shape[0]
-    diag = np.asarray(X.multiply(X).sum(axis=1)).ravel().astype(np.float64)
+    diag = _matfree_diag(X, unit_diag=unit_diag)
     rep_of = np.empty(n, dtype=np.int32)
     best_d2 = np.full(n, np.inf, dtype=np.float64)
     for r in reps:
-        kr = _wl_kernel_column(X, r)
+        kr = _wl_kernel_column(X, r, unit_diag=unit_diag)
         d2 = diag + diag[r] - 2.0 * kr
         mask = d2 < best_d2
         best_d2[mask] = d2[mask]
@@ -483,6 +602,27 @@ class ScanIndexer:
     meta: Dict
 
 
+def _load_indexer_cache(cache_path):
+    """Load a ScanIndexer (method/reps/rep_of/meta) from an .npz cache, or None if absent."""
+    if not (cache_path and os.path.exists(cache_path)):
+        return None
+    z = np.load(cache_path, allow_pickle=True)
+    return ScanIndexer(method=str(z["method"]), reps=list(z["reps"]),
+                       rep_of=z["rep_of"], meta=json.loads(str(z["meta"])))
+
+
+def _save_indexer_cache(cache_path, si):
+    """Atomically write a ScanIndexer to `cache_path` (.npz); returns si for call chaining."""
+    if not cache_path:
+        return si
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    tmp = cache_path[:-4] + ".tmp.npz"
+    np.savez(tmp, method=si.method, reps=np.asarray(si.reps),
+             rep_of=si.rep_of, meta=json.dumps(si.meta))
+    os.replace(tmp, cache_path)
+    return si
+
+
 def build_scan_indexer(
     graphs: Sequence,
     method: str,
@@ -494,15 +634,30 @@ def build_scan_indexer(
     matfree: Optional[bool] = None,
     matfree_threshold: int = 20000,
     random_state: Optional[np.random.RandomState] = None,
+    cache_path: Optional[str] = None,
 ) -> ScanIndexer:
     """
     Build ScanIndexer for a given graph domain.
 
     For method="pivchol" on large domains we use the matrix-free path (no dense N x N kernel).
     `matfree=None` auto-enables it when len(graphs) > matfree_threshold; pass True/False to force.
-    Only pivchol supports matrix-free — fft and graph_kmeans need the full kernel.
+    pivchol and graph_kmeans support matrix-free; fft still needs the full kernel.
+
+    The scan is a deterministic function of the graphs + method + params (independent of the
+    bandit seed), so `cache_path` lets it be built once per target and reused across seeds.
+    NOTE: this cache is written by the CURRENT pivchol code; do not reuse caches built by an
+    older version, as their representatives can differ.
     """
     method = str(method).lower()
+
+    cached = _load_indexer_cache(cache_path)
+    if cached is not None:
+        if len(cached.rep_of) != len(graphs):
+            print(f"[scan] stale cache at {cache_path}: rep_of has {len(cached.rep_of)} "
+                  f"entries but domain has {len(graphs)} arms; rebuilding.", flush=True)
+        else:
+            print(f"[scan] loaded cache {cache_path} (reps={len(cached.reps)})", flush=True)
+            return cached
 
     # ---- pivoted Cholesky: matrix-free for large N (never build dense K) ----
     if method == "pivchol":
@@ -512,25 +667,44 @@ def build_scan_indexer(
             if not _HAS_SCIPY:
                 raise RuntimeError("Matrix-free pivchol requires scipy; install scipy or pass matfree=False.")
             X = wl_feature_matrix(graphs, h=int(wl_h), normalize=True)
-            reps = pivoted_cholesky_matfree(X, m=int(pivchol_m))
-            rep_of = assign_to_reps_matfree(X, reps)
+            # normalize=True -> unit diagonal convention, same as the dense path.
+            reps = pivoted_cholesky_matfree(X, m=int(pivchol_m), unit_diag=True)
+            rep_of = assign_to_reps_matfree(X, reps, unit_diag=True)
             meta = {"wl_h": int(wl_h), "pivchol_m": len(reps), "matfree": True}
-            return ScanIndexer(method="pivchol", reps=reps, rep_of=rep_of, meta=meta)
-        # Dense path (small N): bit-for-bit identical to the original implementation.
-        K = wl_kernel_matrix(graphs, h=int(wl_h), normalize=True, dtype=np.float32)
-        reps = pivoted_cholesky(K, m=int(pivchol_m))
-        rep_of = assign_to_reps(K, reps)
-        meta = {"wl_h": int(wl_h), "pivchol_m": len(reps), "matfree": False}
-        return ScanIndexer(method="pivchol", reps=reps, rep_of=rep_of, meta=meta)
+        else:
+            # Dense path (small N).
+            K = wl_kernel_matrix(graphs, h=int(wl_h), normalize=True, dtype=np.float32)
+            reps = pivoted_cholesky(K, m=int(pivchol_m))
+            rep_of = assign_to_reps(K, reps)
+            meta = {"wl_h": int(wl_h), "pivchol_m": len(reps), "matfree": False}
+        return _save_indexer_cache(cache_path, ScanIndexer(method="pivchol", reps=reps, rep_of=rep_of, meta=meta))
 
-    # ---- fft / graph_kmeans: require the dense kernel ----
+    # ---- graph_kmeans: matrix-free for large N (never build dense K) ----
+    if method in {"graph_kmeans", "kmeans"}:
+        n = len(graphs)
+        use_matfree = (n > int(matfree_threshold)) if matfree is None else bool(matfree)
+        if use_matfree:
+            rng = np.random.RandomState(0) if random_state is None else random_state
+            X = wl_feature_matrix(graphs, h=int(wl_h), normalize=True)
+            labels = kernel_kmeans_matfree(X, k=int(kmeans_k), n_iter=int(kmeans_iter),
+                                           random_state=rng)
+            k_eff = int(np.max(labels)) + 1
+            medoids = cluster_medoids_matfree(X, labels, k=k_eff)
+            rep_of = np.array([medoids[int(labels[i])] for i in range(n)], dtype=np.int32)
+            for md in medoids:
+                rep_of[md] = md
+            meta = {"wl_h": int(wl_h), "kmeans_k": int(kmeans_k),
+                    "kmeans_iter": int(kmeans_iter), "matfree": True}
+            return _save_indexer_cache(cache_path, ScanIndexer(method="graph_kmeans", reps=medoids, rep_of=rep_of, meta=meta))
+
+    # ---- fft / dense graph_kmeans: require the dense kernel ----
     K = wl_kernel_matrix(graphs, h=int(wl_h), normalize=True, dtype=np.float32)
 
     if method == "fft":
         reps = farthest_first_traversal(K, m=int(fft_m), init=0)
         rep_of = assign_to_reps(K, reps)
         meta = {"wl_h": int(wl_h), "fft_m": int(fft_m)}
-        return ScanIndexer(method="fft", reps=reps, rep_of=rep_of, meta=meta)
+        return _save_indexer_cache(cache_path, ScanIndexer(method="fft", reps=reps, rep_of=rep_of, meta=meta))
 
     if method in {"graph_kmeans", "kmeans"}:
         rng = np.random.RandomState(0) if random_state is None else random_state
@@ -542,6 +716,6 @@ def build_scan_indexer(
         for m in medoids:
             rep_of[m] = m
         meta = {"wl_h": int(wl_h), "kmeans_k": int(kmeans_k), "kmeans_iter": int(kmeans_iter)}
-        return ScanIndexer(method="graph_kmeans", reps=medoids, rep_of=rep_of, meta=meta)
+        return _save_indexer_cache(cache_path, ScanIndexer(method="graph_kmeans", reps=medoids, rep_of=rep_of, meta=meta))
 
     raise ValueError(f"Unknown scan method: {method}. Use 'fft', 'graph_kmeans', or 'pivchol'.")

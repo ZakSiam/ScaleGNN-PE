@@ -2,6 +2,7 @@ import numpy as np
 import torch.optim as optim
 import copy
 from nets import NN, GNN, normalize_init
+from peft_nets import apply_peft
 from typing import Optional
 from config import *
 
@@ -72,7 +73,10 @@ class UCBalg:
 
     def _build_optimizer(self):
         # Default: Adam without weight decay (matching the paper's practical setup).
-        return optim.Adam(self.func.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        # Optimize only trainable params. Identical to self.func.parameters() when nothing is
+        # frozen (peft='none'); under PEFT this trains only the adapter/head params.
+        params = [p for p in self.func.parameters() if p.requires_grad]
+        return optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
 
     def _get_optimizer(self, reset: bool = False):
         if (not self.reuse_optimizer) or (self._optimizer is None) or reset:
@@ -86,7 +90,8 @@ class GnnUCB(UCBalg):  # Our main method
                  alg_lambda: float = 1, exploration_coef: float = 1, t_intersect: int = np.inf,
                  num_mlp_layers: int = 2, neuron_per_layer: int = 128, lr: float = 1e-3,
                  nn_aggr_feat = True, train_from_scratch = False, verbose = True,
-                 nn_init_lazy: bool = True, complete_cov_mat: bool = False, random_state = None, path: Optional[str] = None, scan_indexer=None, lazy_grads: bool = True, **kwargs):
+                 nn_init_lazy: bool = True, complete_cov_mat: bool = False, random_state = None, path: Optional[str] = None, scan_indexer=None, lazy_grads: bool = True,
+                 peft: str = 'none', lora_rank: int = 8, lora_alpha: float = 16.0, peft_uncertainty: bool = True, **kwargs):
         super().__init__(net=net, feat_dim=feat_dim, num_mlp_layers=num_mlp_layers, alg_lambda=alg_lambda, verbose = verbose,
                          lr = lr, complete_cov_mat = complete_cov_mat, nn_aggr_feat = nn_aggr_feat, train_from_scratch = train_from_scratch, num_nodes=num_nodes,
                          exploration_coef=exploration_coef, neuron_per_layer=neuron_per_layer, random_state=random_state, path=path, **kwargs)
@@ -99,6 +104,27 @@ class GnnUCB(UCBalg):  # Our main method
         if nn_init_lazy:
             self.func = normalize_init(self.func)
             self.f0 = copy.deepcopy(self.func)
+
+        # --- PEFT: parameter-space compression (axis 2). Default 'none' => full fine-tuning,
+        # identical to the original behavior. Under PEFT we freeze the base weights so the
+        # optimizer trains only a small set S, and (when peft_uncertainty) the frozen f0 used for
+        # NTK features shares the same frozen set, so g and U live in |S| dims instead of ~4.2M.
+        self.peft = str(peft).lower()
+        self.lora_rank = int(lora_rank)
+        self.lora_alpha = float(lora_alpha)
+        self.peft_uncertainty = bool(peft_uncertainty)
+        if self.peft != 'none':
+            self.func = apply_peft(self.func, method=self.peft, lora_rank=self.lora_rank,
+                                   lora_alpha=self.lora_alpha).to(device)
+            # f0 provides the (fixed) NTK features for the posterior variance.
+            self.f0 = copy.deepcopy(self.func)
+            if not self.peft_uncertainty:
+                # Ablation: train PEFT params but measure uncertainty over ALL params.
+                for p in self.f0.parameters():
+                    p.requires_grad_(True)
+            # Resize the NTK dimension and reset U over the (possibly reduced) trainable set of f0.
+            self.num_net_params = sum(p.numel() for p in self.f0.parameters() if p.requires_grad)
+            self.U = self.alg_lambda * torch.ones((self.num_net_params,)).to(device)
 
         if net == 'NN':
             self.name = 'NN-UCB'
@@ -133,7 +159,9 @@ class GnnUCB(UCBalg):  # Our main method
         self.f0.zero_grad()
         out = self.f0(self.action_domain[idx])
         out.backward()
-        return torch.cat([p.grad.flatten().detach() for p in self.f0.parameters()])
+        # Only trainable params carry a gradient; under PEFT the frozen base params have grad=None.
+        # When nothing is frozen (peft='none') this is every parameter, i.e. unchanged behavior.
+        return torch.cat([p.grad.flatten().detach() for p in self.f0.parameters() if p.requires_grad])
 
     def _get_grad(self, idx):
         """Return g[idx], from the eager list if present, else from a lazily-populated cache."""
@@ -151,7 +179,7 @@ class GnnUCB(UCBalg):  # Our main method
             self.f0.zero_grad()
             out = self.f0(graph)
             out.backward()
-            g = torch.cat([p.grad.flatten().detach() for p in self.f0.parameters()])
+            g = torch.cat([p.grad.flatten().detach() for p in self.f0.parameters() if p.requires_grad])
             self.init_grad_list.append(g)
 
     # def get_small_cov(self, g: np.ndarray):
@@ -335,7 +363,7 @@ class PhasedGnnUCB(GnnUCB):
                  alg_lambda: float = 1, exploration_coef: float = 1, t_intersect: int= np.inf,
                  num_mlp_layers: int = 2, neuron_per_layer: int = 128, lr: float = 1e-3,
                  nn_aggr_feat = True, train_from_scratch = False, verbose = True,
-                 nn_init_lazy: bool = True, complete_cov_mat: bool = False, random_state = None, path: Optional[str] = None, scan_indexer=None, scan_apply_to: str = 'both', **kwargs):
+                 nn_init_lazy: bool = True, complete_cov_mat: bool = False, random_state = None, path: Optional[str] = None, scan_indexer=None, scan_apply_to: str = 'both', scan_tie_break: str = 'first', mask_revisit: bool = True, **kwargs):
         super().__init__(net = net, num_nodes = num_nodes, feat_dim = feat_dim, num_actions = num_actions, action_domain = action_domain,
         alg_lambda = alg_lambda, exploration_coef = exploration_coef,
         num_mlp_layers = num_mlp_layers, neuron_per_layer = neuron_per_layer, lr = lr,
@@ -345,10 +373,82 @@ class PhasedGnnUCB(GnnUCB):
         self.t_intersect = t_intersect
         self.scan_indexer = scan_indexer
         self.scan_apply_to = str(scan_apply_to).lower()
+        self.scan_tie_break = str(scan_tie_break).lower()
+        # Every arm ever pulled, so selection never re-picks it. Under a scan
+        # approximation an arm's variance is inherited from its representative and only
+        # drops once the REP is observed, so an unmasked argmax re-queries the same arm
+        # forever and wastes the oracle budget. Masking is unconditional, matching the
+        # reference implementation; only the (C.1) argmax is masked, scoring is untouched.
+        # mask_revisit=False disables masking entirely (arms may be re-pulled), reproducing
+        # the pre-masking behavior for ablation; the visited set is then never consulted.
+        self.mask_revisit = bool(mask_revisit)
+        self.visited = set()
+        if self.scan_tie_break not in {"first", "random"}:
+            raise ValueError(f"scan_tie_break must be 'first' or 'random', got: {scan_tie_break}")
         if net == 'NN':
             self.name = 'PhasedNN-UCB'
         else:
             self.name = 'PhasedGNN-UCB'
+
+    def _mask_visited(self, cand) -> list:
+        """
+        Restrict candidate arms to those not yet pulled.
+
+        Falls back to the full candidate set only if every candidate has already been
+        visited (matching the reference: it repeats within the maximizer set rather than
+        widening to the whole domain).
+        """
+        cand = list(cand)
+        if not self.mask_revisit or not self.visited:
+            return cand
+        unvisited = [c for c in cand if c not in self.visited]
+        return unvisited if unvisited else cand
+
+    def _argmax_over(self, cand, values) -> int:
+        """Tie-aware argmax of `values` over the candidate list `cand`."""
+        vals = np.asarray([float(values[i]) for i in cand], dtype=np.float64)
+        best = vals.max()
+        tied = [c for c, v in zip(cand, vals) if v == best]
+        if len(tied) == 1 or self.scan_tie_break == "first":
+            return int(tied[0])
+        return int(tied[self._rds.randint(len(tied))])
+
+    def _mark(self, ix: int) -> int:
+        """Record a pulled arm so it is masked out next round; returns ix."""
+        self.visited.add(int(ix))
+        return int(ix)
+
+    def explore(self):
+        """Random exploration over the full action set (matches the reference: draw from
+        the whole domain, only record the pull so later selection masks it). Masking the
+        draw pool here would change the RNG stream and diverge from the reference."""
+        ix = int(self._rds.choice(range(self.num_actions)))
+        return self._mark(ix)
+
+    def _argmax_maximizers(self, values) -> int:
+        """
+        argmax of `values` over self.maximizers, with an explicit tie policy.
+
+        Why this exists: under a scan approximation every arm mapped to the same
+        representative receives a byte-identical value, so this argmax is routinely a tie
+        among several arms. Python's max() resolves ties by list order, which means the
+        lowest-indexed arm of the winning cluster is always chosen and the variance signal
+        does no work — the same arm is then re-queried round after round.
+
+        Under an exact full scan the values are distinct floats and ties essentially never
+        occur, so this reduces to plain argmax. That asymmetry makes the tie policy a
+        confound when comparing exact vs approximated runs, hence the flag:
+          - "first"  : original behaviour (lowest-indexed tied arm). Default.
+          - "random" : sample uniformly among the tied arms, via the algorithm's own RNG.
+
+        Ties are compared with exact equality on purpose: under nearest-rep copying the tied
+        values are bit-identical copies, so no tolerance is needed or wanted.
+
+        Already-pulled arms are masked out of the candidate pool first, so the
+        byte-identical-tie pathology can no longer re-query the same cluster arm.
+        """
+        cand = self._mask_visited(self.maximizers)
+        return self._mark(self._argmax_over(cand, values))
 
     def select(self):
         """
@@ -387,9 +487,7 @@ class PhasedGnnUCB(GnnUCB):
                 max_lcb = np.max(lcbs)
                 self.maximizers = [i for i in range(len(ucbs)) if max_lcb <= ucbs[i]]
 
-            maximizer_vars = [vars[i] for i in self.maximizers]
-            ix = self.maximizers[int(np.argmax(maximizer_vars))]
-            return int(ix)
+            return self._argmax_maximizers(vars)
 
         apply = getattr(self, "scan_apply_to", "both")
         apply = str(apply).lower().strip()
@@ -402,6 +500,15 @@ class PhasedGnnUCB(GnnUCB):
         reps = list(self.scan_indexer.reps)
         rep_of = self.scan_indexer.rep_of  # shape (num_actions,)
         sqrt_beta = float(np.sqrt(self.exploration_coef))
+
+        def _spread(vals_at_reps: np.ndarray) -> np.ndarray:
+            """
+            Reconstruct a per-arm quantity from its values at the representatives: copy each
+            rep's value to the arms assigned to it. `vals_at_reps` is ordered to match `reps`.
+            """
+            full = np.zeros(self.num_actions, dtype=np.float64)
+            full[np.asarray(reps, dtype=np.int64)] = vals_at_reps
+            return full[np.asarray(rep_of, dtype=np.int64)]
 
         # -------------------------
         # (C.2) maximizer update
@@ -433,55 +540,44 @@ class PhasedGnnUCB(GnnUCB):
             # -------------------------
             if not use_c1:
                 # Exact (C.1): max variance among maximizers.
-                maximizer_vars = [vars[i] for i in self.maximizers]
-                ix = self.maximizers[int(np.argmax(maximizer_vars))]
-                return int(ix)
+                return self._argmax_maximizers(vars)
 
-            # Approx (C.1): map each arm to its representative's variance.
+            # Approx (C.1): reconstruct each arm's variance from the representatives only.
             vars_arr = np.asarray(vars, dtype=np.float64)
-            def _approx_var(i: int) -> float:
-                r = int(rep_of[i])
-                return float(vars_arr[r])
+            approx_var = _spread(vars_arr[np.asarray(reps, dtype=np.int64)])
+            return self._argmax_maximizers(approx_var)
 
-            ix = max(self.maximizers, key=_approx_var)
-            return int(ix)
-
-        # Approximate (C.2): evaluate mean/var only on reps and share across mapped arms.
-        mean_rep = np.zeros(self.num_actions, dtype=np.float64)
-        var_rep = np.zeros(self.num_actions, dtype=np.float64)
-        for r in reps:
+        # Approximate (C.2): evaluate mean/var only on reps, then reconstruct over the domain.
+        # mean_m / var_m are compact (m,) vectors ordered to match `reps`.
+        mean_m = np.zeros(len(reps), dtype=np.float64)
+        var_m = np.zeros(len(reps), dtype=np.float64)
+        for j, r in enumerate(reps):
             post_mean = self.func(self.action_domain[r])
             g = self._get_grad(r)
             post_var = torch.sqrt(torch.sum(g * g / self.U) / self.neuron_per_layer)
-            mean_rep[r] = post_mean.item()
-            var_rep[r] = post_var.item()
+            mean_m[j] = post_mean.item()
+            var_m[j] = post_var.item()
 
-        def _ucb(i: int) -> float:
-            r = int(rep_of[i])
-            return float(mean_rep[r] + sqrt_beta * var_rep[r])
-
-        def _lcb(i: int) -> float:
-            r = int(rep_of[i])
-            return float(mean_rep[r] - sqrt_beta * var_rep[r])
+        mean_all = _spread(mean_m)
+        var_all = _spread(var_m)
+        ucb_all = mean_all + sqrt_beta * var_all
+        lcb_all = mean_all - sqrt_beta * var_all
 
         # Update maximizers (approximate)
         if t > self.t_intersect:
-            max_lcb = max(_lcb(i) for i in self.maximizers)
-            self.maximizers = [i for i in self.maximizers if max_lcb <= _ucb(i)]
+            cand = np.asarray(self.maximizers, dtype=np.int64)
+            max_lcb = float(np.max(lcb_all[cand]))
+            self.maximizers = [i for i in self.maximizers if max_lcb <= ucb_all[i]]
         else:
-            max_lcb = max(_lcb(i) for i in range(self.num_actions))
-            self.maximizers = [i for i in range(self.num_actions) if max_lcb <= _ucb(i)]
+            max_lcb = float(np.max(lcb_all))
+            self.maximizers = [i for i in range(self.num_actions) if max_lcb <= ucb_all[i]]
 
         # -------------------------
         # (C.1) next-arm selection
         # -------------------------
         if use_c1:
-            # Approx (C.1): pick by representative variance.
-            def _approx_var(i: int) -> float:
-                r = int(rep_of[i])
-                return float(var_rep[r])
-            ix = max(self.maximizers, key=_approx_var)
-            return int(ix)
+            # Approx (C.1): pick by reconstructed variance.
+            return self._argmax_maximizers(var_all)
 
         # Exact (C.1): compute variance exactly for maximizers (no GNN forward needed here).
         def _exact_var(i: int) -> float:
@@ -489,6 +585,7 @@ class PhasedGnnUCB(GnnUCB):
             post_var = torch.sqrt(torch.sum(g * g / self.U) / self.neuron_per_layer)
             return float(post_var.item())
 
-        ix = max(self.maximizers, key=_exact_var)
-        return int(ix)
+        cand = self._mask_visited(self.maximizers)
+        ix = max(cand, key=_exact_var)
+        return self._mark(ix)
 

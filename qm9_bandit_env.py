@@ -1,4 +1,3 @@
-# qm9_bandit_env.py
 import os
 import numpy as np
 

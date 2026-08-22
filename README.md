@@ -1,192 +1,75 @@
-# Improved GNN-PE for QM9 graph bandits
+# ScaleGNN-PE
 
-This repository is a cleaned, QM9-focused extension of the public [GNNBO](https://github.com/lasgroup/GNNBO) codebase for the paper *Graph Neural Network Bandits*. The project studies how to make GNN Phased Elimination (GNN-PE) more practical for graph bandit optimization over molecular candidates:
+Reference implementation for **"Scaling Graph Neural Bandits to Million-Molecule Virtual
+Screening"** (KDD 2027, AI for Science track).
 
-- fine-tuned GNN-PE versus retraining from scratch,
-- GNN-UCB scratch and fine-tune baselines,
-- graph-space scan acceleration for the two expensive GNN-PE scan steps using farthest-first traversal (FFT) and WL-kernel graph k-means,
-- separate scan ablations for Eq. (1) only, Eq. (2) only, and both equations,
-- GP-UCB, GP-EI, GP-TS, and Random baselines.
+GNN phased elimination (GNN-PE), introduced together with GNN-UCB by Kassraie, Krause, and
+Bogunovic [[1](#references)], is theoretically grounded but retrains its network every
+episode and rescans the entire candidate pool twice per round — once for uncertainty-based
+exploration, once for confidence-based elimination. **ScaleGNN-PE** keeps that
+phased structure and removes the redundant computation with two orthogonal compressions:
 
-## Repository layout
+* **Parameter-space compression** — each episode warm-starts from the previous episode's
+  weights (`--train_modes finetune`) and adapts only a subnetwork
+  (`--peft {lora,last_layer}`), shrinking both the training cost and the dimension of the
+  diagonal-NTK uncertainty model from `p` to `s`.
+* **Graph-domain compression** — normalized sparse Weisfeiler–Lehman features `X` define an
+  implicit kernel `K = XXᵀ`; **matrix-free pivoted Cholesky** picks `M` representatives
+  without ever forming the `N×N` kernel, and every molecule inherits the posterior
+  `(μ̂, σ̂)` of its nearest representative (`--domain_scan_method pivchol`).
 
-```text
-.
-├── algorithms.py                  # GNN-UCB and scan-aware GNN-PE
-├── graph_scan_accel.py            # WL kernel, FFT, and graph k-means scan indexers
-├── qm9_bandit_env.py              # QM9 finite-action bandit environment
-├── run_qm9_phasedgp.py            # GNN-PE scratch/fine-tune runner
-├── run_qm9_gnnucb.py               # GNN-UCB scratch/fine-tune runner
-├── run_qm9_gp_baselines.py         # GP-UCB / GP-EI / GP-TS / Random runner
-├── scripts/
-│   ├── generate_report_outputs.py # Figure 1a, Figure 1b, runtime summary
-│   └── plot_scan_ablations.py      # 8-way scan-ablation figure + runtime table
-└── requirements.txt
-```
-
-`data/`, `results/`, and `figures/` are intentionally ignored by Git. A fresh run downloads QM9 into `data/qm9/` automatically through PyTorch Geometric.
+The two axes compose multiplicatively, which is what makes phased elimination run at
+`n = 10⁶` where GNN-PE and GNN-UCB go out of memory.
 
 ## Setup
 
-The code was cleaned around a lean Python environment. A typical setup is:
-
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+python -m pip install pyarrow tqdm     # needed for the docking (Parquet) pipeline
 ```
 
-If the platform needs a specific PyTorch / PyTorch Geometric wheel combination, one must install the compatible PyTorch stack first, then install the remaining requirements.
+Install a PyTorch / PyTorch Geometric wheel combination matching your CUDA version first if
+the platform needs one. All reported experiments ran on NVIDIA A100 80 GB GPUs.
 
-## Reproduce the experiments
+## Data
 
-The experiment uses QM9 domains with `|G|=1000`, `T=300`, and seeds `0..9`. All runner defaults are aligned with those values; the commands below spell out the result folders so the plotting scripts can consume them directly.
+**QM9 and ZINC** download automatically through PyTorch Geometric into `data/qm9/` and
+`data/zinc/` on first run. Each run draws a candidate pool of `|G| = 1000` graphs.
 
-### 1. GNN-PE scratch and fine-tune
+**Docking libraries** come from the DrugImprover ZINC15 subsets (1 M molecules per target).
+`data/docking/<TARGET>_processed.parquet` ships with the repo for `3CLPro`, `rtcb`, and
+`6T2W`; convert each once to PyG shards:
 
 ```bash
-for seed in {0..9}; do
-  python run_qm9_phasedgp.py \
-    --seed "$seed" \
-    --train_modes scratch,finetune \
-    --exp_result_folder results/qm9_phasedgp_T300_N1000
-done
+python SMILES_to_graph_converter/smiles_parquet_to_pyg.py \
+  --input data/docking/3CLPro_processed.parquet --target 3CLPro --output-dir data/graphs/3CLPro
 ```
 
-### 2. GNN-UCB scratch and fine-tune
+Raw docking scores are normalized so that higher reward = more favorable predicted binding
+(`--objective dock_norm`).
 
-```bash
-for seed in {0..9}; do
-  python run_qm9_gnnucb.py \
-    --seed "$seed" \
-    --train_modes scratch,finetune \
-    --exp_result_folder results/qm9_gnnucb_T300_N1000
-done
+## Acknowledgements
+
+ScaleGNN-PE builds directly on **GNN-PE** and **GNN-UCB**, the algorithms introduced by
+Kassraie, Krause, and Bogunovic [[1](#references)]. Their phased-elimination scheme and its
+NTK-based confidence bounds are the starting point for this work — the contributions here
+are the parameter-space and graph-domain compressions layered on top — and both algorithms
+serve as baselines throughout our experiments. The bandit and graph-environment scaffolding
+in `algorithms.py` and `graph_env/` follows their formulation. We thank the authors for
+making the method and its analysis available.
+
+## References
+
+[1] P. Kassraie, A. Krause, and I. Bogunovic. **Graph Neural Network Bandits**. *Advances in
+Neural Information Processing Systems (NeurIPS)*, 2022.
+
+```bibtex
+@inproceedings{kassraie2022graph,
+  title     = {Graph Neural Network Bandits},
+  author    = {Kassraie, Parnian and Krause, Andreas and Bogunovic, Ilija},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2022}
+}
 ```
-
-### 3. GP and Random baselines
-
-```bash
-for baseline in gpucb gpei gpts random; do
-  for seed in {0..9}; do
-    python run_qm9_gp_baselines.py \
-      --baseline "$baseline" \
-      --seed "$seed" \
-      --exp_result_folder results/qm9_gp_baselines_T300_N1000
-  done
-done
-```
-
-### 4. Fine-tuned GNN-PE scan accelerations
-
-The GNN-PE runner exposes:
-
-- `--domain_scan_method full|fft|graph_kmeans`
-- `--domain_scan_apply_to both|c1|c2`
-
-where `c1` means Eq. (C.1) only and `c2` means Eq. (C.2) only.
-
-```bash
-# Approximate Eq. (1) and Eq. (2)
-for seed in {0..9}; do
-  python run_qm9_phasedgp.py \
-    --seed "$seed" \
-    --train_modes finetune \
-    --domain_scan_method fft \
-    --domain_scan_apply_to both \
-    --exp_result_folder results/qm9_phasedgp_T300_N1000_fft
-
-  python run_qm9_phasedgp.py \
-    --seed "$seed" \
-    --train_modes finetune \
-    --domain_scan_method graph_kmeans \
-    --domain_scan_apply_to both \
-    --exp_result_folder results/qm9_phasedgp_T300_N1000_kmeans
-done
-```
-
-```bash
-# Eq. (1)-only ablations
-for seed in {0..9}; do
-  python run_qm9_phasedgp.py \
-    --seed "$seed" \
-    --train_modes finetune \
-    --domain_scan_method fft \
-    --domain_scan_apply_to c1 \
-    --exp_result_folder results/qm9_phasedgp_T300_N1000_fft_C1only
-
-  python run_qm9_phasedgp.py \
-    --seed "$seed" \
-    --train_modes finetune \
-    --domain_scan_method graph_kmeans \
-    --domain_scan_apply_to c1 \
-    --exp_result_folder results/qm9_phasedgp_T300_N1000_kmeans_C1only
-done
-```
-
-```bash
-# Eq. (2)-only ablations
-for seed in {0..9}; do
-  python run_qm9_phasedgp.py \
-    --seed "$seed" \
-    --train_modes finetune \
-    --domain_scan_method fft \
-    --domain_scan_apply_to c2 \
-    --exp_result_folder results/qm9_phasedgp_T300_N1000_fft_C2only
-
-  python run_qm9_phasedgp.py \
-    --seed "$seed" \
-    --train_modes finetune \
-    --domain_scan_method graph_kmeans \
-    --domain_scan_apply_to c2 \
-    --exp_result_folder results/qm9_phasedgp_T300_N1000_kmeans_C2only
-done
-```
-
-## Regenerate figures and runtime tables
-
-After the result folders above exist:
-
-```bash
-python scripts/generate_report_outputs.py \
-  --results_root results \
-  --out_dir figures/report
-```
-
-This writes:
-
-- `figures/report/figure_1a_gnnpe_scans.pdf`
-- `figures/report/figure_1b_main_comparison.pdf`
-- `figures/report/runtime_summary.csv`
-
-To regenerate the full 8-way scan-ablation comparison:
-
-```bash
-python scripts/plot_scan_ablations.py \
-  --results_root results \
-  --out_dir figures/scan_ablations
-```
-
-This writes:
-
-- `figures/scan_ablations/scan_ablation_8way.pdf`
-- `figures/scan_ablations/scan_ablation_runtime_summary.csv`
-
-## Result-file format
-
-All runners emit JSON files with a shared structure:
-
-- `exp_results.regrets`: cumulative regret over rounds,
-- `params`: the full run configuration, including seed and train mode,
-- `duration_total`: runtime in minutes.
-
-The plotting scripts consume only that shared contract, so additional compatible runs can be added without changing the reporting layer.
-
-## Provenance
-
-This codebase keeps the original project license and builds on the public GNNBO implementation associated with:
-
-> P. Kassraie, A. Krause, and I. Bogunovic. *Graph Neural Network Bandits*. NeurIPS, 2022.
-
-The scan-acceleration additions in this repository are project-specific extensions for the QM9 study described above.
