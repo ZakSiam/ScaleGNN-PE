@@ -38,9 +38,9 @@ the platform needs one. All reported experiments ran on NVIDIA A100 80 GB GPUs.
 **QM9 and ZINC** download automatically through PyTorch Geometric into `data/qm9/` and
 `data/zinc/` on first run. Each run draws a candidate pool of `|G| = 1000` graphs.
 
-**Docking libraries** come from the DrugImprover ZINC15 subsets (1 M molecules per target).
-`data/docking/<TARGET>_processed.parquet` ships with the repo for `3CLPro`, `rtcb`, and
-`6T2W`; convert each once to PyG shards:
+**Docking libraries** are derived from the DrugImprover ZINC15 subsets (1 M molecules per target).
+The processed files `data/docking/<TARGET>_processed.parquet` for `3CLPro`, `rtcb`, and
+`6T2W` are not included in this repository due to their size (they are available from the authors on request). Place each file under `data/docking/` and convert it once to PyG shards:
 
 ```bash
 python SMILES_to_graph_converter/smiles_parquet_to_pyg.py \
